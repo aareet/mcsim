@@ -5,6 +5,8 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from scipy.stats import norm
+import matplotlib.pyplot as plt
+import seaborn as sns
 import sys
 import os
 
@@ -171,7 +173,10 @@ def risk_metrics(terminal_values, init_value, horizon_days):
         "CVaR_5pct": float(cvar_5),
         "probability_loss": float(prob_loss),
         "terminal_value_mean": float(terminal_values.mean()),
-        "terminal_value_median": float(np.median(terminal_values))
+        "terminal_value_median": float(np.median(terminal_values)),
+        "terminal_value_max": float(np.max(terminal_values)),
+        "terminal_value_min": float(np.min(terminal_values)),
+        "std_terminal_value": float(terminal_values.std())
     }
 
 def create_sample_excel():
@@ -186,6 +191,73 @@ def create_sample_excel():
     df.to_excel(filename, index=False, engine='openpyxl')
     print(f"Created sample Excel file: {filename}")
     return filename
+
+def plot_histogram(terminal_values, init_value, mean_value, median_value, var_5pct_value, output="histogram.png"):
+    plt.figure(figsize=(9,6))
+    sns.histplot(terminal_values, bins=50, color='navy', alpha=0.7)
+    plt.axvline(init_value, color='black', linestyle='--', lw=1.2, label='Initial Value')
+    plt.axvline(mean_value, color='blue', linestyle='-', lw=2, label='Mean')
+    plt.axvline(median_value, color='purple', linestyle='-', lw=2, label='Median')
+    plt.axvline(var_5pct_value, color='red', linestyle='-', lw=2, label='5% VaR')
+    plt.xlabel('Terminal Portfolio Value ($)')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Monte Carlo Simulated Portfolio Values')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output)
+    plt.close()
+
+def plot_paths_confidence_bands(port_logret_paths, init_value, output="portfolio_evolution.png"):
+    n_paths, n_days = min(20, len(port_logret_paths)), port_logret_paths.shape[1]
+    gross_paths = np.exp(port_logret_paths[:n_paths])
+    path_values = np.column_stack([np.full(n_paths, init_value), init_value * gross_paths.cumprod(axis=1)])
+    days = np.arange(n_days+1)
+    for i in range(n_paths):
+        plt.plot(days, path_values[i], color='steelblue', lw=0.8, alpha=0.8)
+    # Percentile bands
+    all_paths = np.exp(port_logret_paths)
+    all_values = np.column_stack([np.full(all_paths.shape[0], init_value), init_value * all_paths.cumprod(axis=1)])
+    percentiles = np.percentile(all_values, [5,25,50,75,95], axis=0)
+    plt.fill_between(days, percentiles[0], percentiles[4], color='navy', alpha=0.12, label='5-95% band')
+    plt.fill_between(days, percentiles[1], percentiles[3], color='navy', alpha=0.22, label='25-75% band')
+    plt.plot(days, percentiles[2], color='red', lw=2, label='Median')
+    plt.axhline(init_value, color='black', linestyle='--', lw=1.2, label='Initial Value')
+    plt.xlabel('Trading Days')
+    plt.ylabel('Portfolio Value ($)')
+    plt.title('Simulated Portfolio Value Evolution with Confidence Bands')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output)
+    plt.close()
+
+def plot_risk_bar(metrics_dict, output="risk_metrics.png"):
+    risk_data = [
+        ("Expected Return", metrics_dict["expected_return"], "Return"),
+        ("Volatility (Std Dev)", metrics_dict["volatility"], "Risk"),
+        ("Value at Risk (5%)", metrics_dict["VaR_5pct"], "Risk"),
+        ("Conditional VaR (5%)", metrics_dict["CVaR_5pct"], "Risk"),
+        ("Probability of Loss", metrics_dict["probability_loss"], "Risk"),
+        ("Sharpe Ratio (approx)", metrics_dict["expected_return"]/metrics_dict["volatility"] if metrics_dict["volatility"]>0 else 0, "Risk-Adjusted"),
+        ("Maximum Gain", metrics_dict["terminal_value_max"] / 100000.0 - 1, "Return"),
+        ("Maximum Loss", metrics_dict["terminal_value_min"] / 100000.0 - 1, "Risk"),
+    ]
+    df = pd.DataFrame(risk_data, columns=['Metric', 'Value', 'Category'])
+    palette = {'Return':'royalblue', 'Risk':'crimson', 'Risk-Adjusted':'forestgreen'}
+    plt.figure(figsize=(9,6))
+    metric_fmt = []
+    for m in df['Metric']:
+        if "Ratio" in m: metric_fmt.append("{:.2f}")
+        else: metric_fmt.append("{:.2%}")
+    bars = sns.barplot(data=df, y='Metric', x='Value', hue='Category', palette=palette, dodge=False, orient='h')
+    for i, (val, fmt) in enumerate(zip(df['Value'], metric_fmt)):
+        plt.text(val if val>0 else 0, i, fmt.format(val), va='center', ha='left' if val>0 else 'right',
+                 fontsize=10, color='black', weight='bold')
+    plt.title('Monte Carlo Portfolio Risk Analysis')
+    plt.xlabel('Value')
+    plt.legend(title='Category')
+    plt.tight_layout()
+    plt.savefig(output)
+    plt.close()
 
 def main():
     # Configuration
@@ -292,6 +364,19 @@ def main():
         'Annualized_Mean_Return': mu_ann.values
     })
     portfolio_summary.to_csv('portfolio_summary.csv', index=False)
+
+    # Generate charts
+    pd.DataFrame({'terminal_values': terminal_values, 'simple_returns': terminal_values/init_value-1.0}).to_csv('monte_carlo_results.csv', index=False)
+    
+    plot_histogram(
+        terminal_values, init_value,
+        metrics["terminal_value_mean"], metrics["terminal_value_median"],
+        metrics["VaR_5pct"]*init_value + init_value,
+        output="histogram.png"
+    )
+    plot_paths_confidence_bands(port_logret_paths, init_value, output="portfolio_evolution.png")
+    plot_risk_bar(metrics, output="risk_metrics.png")
+    print("Charts saved: histogram.png, portfolio_evolution.png, risk_metrics.png")
     
     print(f"\nResults saved to:")
     print(f"  - monte_carlo_results.csv (simulation outcomes)")
