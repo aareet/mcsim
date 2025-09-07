@@ -1,54 +1,168 @@
 # monte_carlo_portfolio.py
-# Requirements: pip install numpy pandas yfinance scipy
+# Requirements: pip install numpy pandas yfinance scipy openpyxl
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from scipy.stats import norm
+import sys
+import os
+
+def load_portfolio_from_excel(excel_file, sheet_name=None):
+    """
+    Load portfolio holdings from Excel file.
+    Expected format:
+    - Column 1: 'Ticker' or 'Symbol' (e.g., AAPL, MSFT)
+    - Column 2: 'Weight' or 'Allocation' (e.g., 0.35 or 35%)
+    
+    Alternative formats supported:
+    - 'Ticker', 'Shares', 'Price' (will calculate weights from market values)
+    - 'Symbol', 'Market_Value' (will calculate relative weights)
+    """
+    try:
+        # Read Excel file
+        if sheet_name:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+        else:
+            df = pd.read_excel(excel_file, engine='openpyxl')
+        
+        # Clean column names (remove spaces, convert to lowercase)
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+        
+        # Try to identify ticker column
+        ticker_cols = ['ticker', 'symbol', 'stock', 'asset']
+        ticker_col = None
+        for col in ticker_cols:
+            if col in df.columns:
+                ticker_col = col
+                break
+        
+        if ticker_col is None:
+            # Assume first column is ticker
+            ticker_col = df.columns[0]
+            print(f"Warning: Using first column '{ticker_col}' as ticker column")
+        
+        # Extract tickers
+        tickers = df[ticker_col].dropna().astype(str).str.strip().str.upper().tolist()
+        
+        # Try to calculate weights
+        weights = None
+        
+        # Method 1: Direct weight/allocation column
+        weight_cols = ['weight', 'allocation', 'percent', 'percentage', 'allocation_%']
+        for col in weight_cols:
+            if col in df.columns:
+                weights = df[col].dropna().values
+                # Convert percentages to decimals if needed
+                if np.max(weights) > 1:
+                    weights = weights / 100.0
+                break
+        
+        # Method 2: Calculate from shares and price
+        if weights is None and 'shares' in df.columns and 'price' in df.columns:
+            market_values = df['shares'] * df['price']
+            weights = market_values / market_values.sum()
+            weights = weights.values
+        
+        # Method 3: Use market values directly
+        if weights is None:
+            value_cols = ['market_value', 'value', 'amount', 'market_val']
+            for col in value_cols:
+                if col in df.columns:
+                    market_values = df[col].dropna().values
+                    weights = market_values / market_values.sum()
+                    break
+        
+        # Method 4: Equal weights if no weight info found
+        if weights is None:
+            print("Warning: No weight information found. Using equal weights.")
+            weights = np.ones(len(tickers)) / len(tickers)
+        
+        # Ensure same length
+        min_len = min(len(tickers), len(weights))
+        tickers = tickers[:min_len]
+        weights = weights[:min_len]
+        
+        # Normalize weights to sum to 1
+        weights = np.array(weights, dtype=float)
+        weights = weights / weights.sum()
+        
+        print(f"Loaded {len(tickers)} holdings from Excel file:")
+        for i, (ticker, weight) in enumerate(zip(tickers, weights)):
+            print(f"  {ticker}: {weight:.4f} ({weight*100:.2f}%)")
+        
+        return tickers, weights
+        
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        print("Please ensure your Excel file has the following format:")
+        print("Column 1: Ticker/Symbol (AAPL, MSFT, etc.)")
+        print("Column 2: Weight/Allocation (0.35 or 35%)")
+        sys.exit(1)
 
 def download_prices(tickers, start="2015-01-01", end=None):
+    """Download historical prices for given tickers"""
     if end is None:
         end = datetime.today().strftime("%Y-%m-%d")
-    df = yf.download(tickers, start=start, end=end, auto_adjust=True)["Close"]
+    
+    print(f"Downloading price data for {len(tickers)} assets from {start} to {end}...")
+    df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    
     if isinstance(df, pd.Series):
         df = df.to_frame()
-    return df.dropna(how="all").dropna(axis=1, how="any")
+    
+    # Check for missing data
+    initial_assets = len(tickers)
+    df = df.dropna(how="all").dropna(axis=1, how="any")
+    final_assets = len(df.columns)
+    
+    if final_assets < initial_assets:
+        missing = set(tickers) - set(df.columns)
+        print(f"Warning: {initial_assets - final_assets} assets dropped due to insufficient data: {missing}")
+    
+    return df
 
 def compute_log_returns(price_df):
+    """Compute daily log returns"""
     return np.log(price_df / price_df.shift(1)).dropna()
 
 def annualize_mean_cov(mu_daily, cov_daily, trading_days=252):
+    """Annualize daily statistics"""
     mu_ann = mu_daily * trading_days
     cov_ann = cov_daily * trading_days
     return mu_ann, cov_ann
 
 def simulate_paths(mu_daily, cov_daily, weights, init_value=100000.0, days=252, n_sims=10000, seed=42):
+    """Run Monte Carlo simulation"""
     np.random.seed(seed)
     k = len(weights)
-    L = np.linalg.cholesky(cov_daily)  # correlation structure
-    # Pre-generate standard normals: shape (n_sims, days, k)
+    L = np.linalg.cholesky(cov_daily)  # Cholesky decomposition for correlation
+    
+    # Generate correlated random returns
     Z = np.random.normal(size=(n_sims, days, k))
-    # Create correlated daily returns: r_t = mu + L z
-    # Broadcast mu to (days, k)
-    mu_vec = mu_daily.values  # shape (k,)
-    correlated = mu_vec + np.einsum("ij,sdj->sdi", L, Z)  # (n_sims, days, k)
-    # Portfolio daily log-return per scenario per day
+    mu_vec = mu_daily.values
+    correlated = mu_vec + np.einsum("ij,sdj->sdi", L, Z)
+    
+    # Portfolio daily log-return per scenario
     w = np.asarray(weights)
-    port_logret = np.einsum("k,sdk->sd", w, correlated)  # (n_sims, days)
-    # Convert log-returns to gross simple returns, compound to terminal wealth
-    gross = np.exp(port_logret)  # per day gross return
-    terminal_gross = gross.prod(axis=1)  # (n_sims,)
+    port_logret = np.einsum("k,sdk->sd", w, correlated)
+    
+    # Convert to terminal values
+    gross = np.exp(port_logret)
+    terminal_gross = gross.prod(axis=1)
     terminal_values = init_value * terminal_gross
+    
     return terminal_values, port_logret, gross
 
 def risk_metrics(terminal_values, init_value, horizon_days):
-    # Simple horizon return
+    """Calculate risk metrics"""
     returns = terminal_values / init_value - 1.0
     exp_ret = returns.mean()
     vol = returns.std(ddof=1)
-    var_5 = np.quantile(returns, 0.05)  # 5% quantile
+    var_5 = np.quantile(returns, 0.05)
     cvar_5 = returns[returns <= var_5].mean() if (returns <= var_5).any() else var_5
     prob_loss = (returns < 0).mean()
+    
     return {
         "horizon_days": horizon_days,
         "expected_return": float(exp_ret),
@@ -60,60 +174,128 @@ def risk_metrics(terminal_values, init_value, horizon_days):
         "terminal_value_median": float(np.median(terminal_values))
     }
 
+def create_sample_excel():
+    """Create a sample Excel file for reference"""
+    sample_data = {
+        'Ticker': ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'TLT', 'GLD'],
+        'Weight': [0.25, 0.25, 0.20, 0.15, 0.10, 0.05]
+    }
+    
+    df = pd.DataFrame(sample_data)
+    filename = 'sample_portfolio.xlsx'
+    df.to_excel(filename, index=False, engine='openpyxl')
+    print(f"Created sample Excel file: {filename}")
+    return filename
+
 def main():
-    # User parameters
-    tickers = ["AAPL", "MSFT", "TLT", "GLD"]  # example set
-    weights = [0.35, 0.35, 0.20, 0.10]        # must sum to 1
-    start = "2015-01-01"
-    end = None
+    # Configuration
+    excel_file = "portfolio_holdings.xlsx"  # Change this to your Excel file path
+    sheet_name = None  # Use first sheet by default, or specify sheet name
+    start_date = "2015-01-01"
+    end_date = None
     init_value = 100000.0
-    horizon_days = 252           # e.g., 1 year
+    horizon_days = 252
     n_sims = 20000
     seed = 123
-
-    # Checks
-    w = np.array(weights, dtype=float)
-    w = w / w.sum()
-
-    # Data and estimates
-    prices = download_prices(tickers, start=start, end=end)
+    
+    print("=== Monte Carlo Portfolio Simulation ===\n")
+    
+    # Check if Excel file exists
+    if not os.path.exists(excel_file):
+        print(f"Excel file '{excel_file}' not found.")
+        create_sample = input("Create a sample Excel file? (y/n): ").lower().strip()
+        if create_sample == 'y':
+            excel_file = create_sample_excel()
+        else:
+            print("Please create an Excel file with your portfolio holdings and try again.")
+            sys.exit(1)
+    
+    # Load portfolio from Excel
+    tickers, weights = load_portfolio_from_excel(excel_file, sheet_name)
+    
+    # Download price data
+    prices = download_prices(tickers, start=start_date, end=end_date)
+    
+    # Align weights with available data
+    available_tickers = list(prices.columns)
+    if len(available_tickers) != len(tickers):
+        print("Adjusting weights for available data...")
+        # Map weights to available tickers
+        ticker_weight_map = dict(zip(tickers, weights))
+        aligned_weights = []
+        for ticker in available_tickers:
+            if ticker in ticker_weight_map:
+                aligned_weights.append(ticker_weight_map[ticker])
+            else:
+                aligned_weights.append(0.0)
+        
+        # Renormalize
+        aligned_weights = np.array(aligned_weights)
+        if aligned_weights.sum() > 0:
+            aligned_weights = aligned_weights / aligned_weights.sum()
+            weights = aligned_weights
+        else:
+            print("Error: No valid tickers found in price data")
+            sys.exit(1)
+    
+    # Calculate returns and statistics
     log_rets = compute_log_returns(prices)
-
-    # Align weights to downloaded tickers order
-    cols = list(prices.columns)
-    if len(cols) != len(w):
-        raise ValueError(f"Number of tickers ({len(cols)}) != number of weights ({len(w)}).")
-    mu_daily = log_rets.mean()                  # vector of daily log-return means
-    cov_daily = log_rets.cov()                  # daily log-return covariance matrix
-
-    # Optional: annualized figures for reference
-    mu_ann, cov_ann = annualize_mean_cov(mu_daily, cov_daily, trading_days=252)
-
-    # Monte Carlo simulation
+    mu_daily = log_rets.mean()
+    cov_daily = log_rets.cov()
+    mu_ann, cov_ann = annualize_mean_cov(mu_daily, cov_daily)
+    
+    # Run Monte Carlo simulation
+    print(f"\nRunning Monte Carlo simulation...")
+    print(f"Simulations: {n_sims:,}")
+    print(f"Horizon: {horizon_days} days")
+    print(f"Initial value: ${init_value:,.2f}")
+    
     terminal_values, port_logret_paths, gross_paths = simulate_paths(
-        mu_daily, cov_daily, w, init_value=init_value, days=horizon_days, n_sims=n_sims, seed=seed
+        mu_daily, cov_daily, weights, 
+        init_value=init_value, days=horizon_days, n_sims=n_sims, seed=seed
     )
-
-    # Risk metrics
+    
+    # Calculate and display results
     metrics = risk_metrics(terminal_values, init_value, horizon_days)
-
-    # Output
-    print("Input tickers:", cols)
-    print("Weights (sum=1):", w.tolist())
-    print("Daily log-return mean (per asset):")
-    print(mu_daily.to_string())
-    print("\nAnnualized log-return mean (approx):")
-    print(mu_ann.to_string())
-    print("\nHorizon metrics:")
-    for k, v in metrics.items():
-        print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
-
-    # Save distributions for further analysis (optional)
-    pd.DataFrame({"terminal_values": terminal_values}).to_csv("mc_terminal_values.csv", index=False)
-    # Save per-scenario returns summary if desired
-    # Example: final simple returns
-    final_simple_returns = terminal_values / init_value - 1.0
-    pd.DataFrame({"final_simple_return": final_simple_returns}).to_csv("mc_final_returns.csv", index=False)
+    
+    print(f"\n=== SIMULATION RESULTS ===")
+    print(f"Portfolio Assets: {available_tickers}")
+    print(f"Final Weights: {[f'{w:.4f}' for w in weights]}")
+    print(f"\nDaily Log-Return Statistics:")
+    for asset, ret in mu_daily.items():
+        print(f"  {asset}: {ret:.6f} ({ret*252:.4f} annualized)")
+    
+    print(f"\nHorizon Risk Metrics ({horizon_days} days):")
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            if 'return' in key or 'var' in key.lower():
+                print(f"  {key}: {value:.4f} ({value*100:.2f}%)")
+            elif 'value' in key:
+                print(f"  {key}: ${value:,.2f}")
+            else:
+                print(f"  {key}: {value:.6f}")
+        else:
+            print(f"  {key}: {value}")
+    
+    # Save results
+    results_df = pd.DataFrame({
+        'terminal_values': terminal_values,
+        'simple_returns': terminal_values / init_value - 1.0
+    })
+    results_df.to_csv('monte_carlo_results.csv', index=False)
+    
+    # Save portfolio summary
+    portfolio_summary = pd.DataFrame({
+        'Ticker': available_tickers,
+        'Weight': weights,
+        'Daily_Mean_Return': mu_daily.values,
+        'Annualized_Mean_Return': mu_ann.values
+    })
+    portfolio_summary.to_csv('portfolio_summary.csv', index=False)
+    
+    print(f"\nResults saved to:")
+    print(f"  - monte_carlo_results.csv (simulation outcomes)")
+    print(f"  - portfolio_summary.csv (portfolio details)")
 
 if __name__ == "__main__":
     main()
